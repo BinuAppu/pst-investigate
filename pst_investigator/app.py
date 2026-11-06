@@ -3,6 +3,7 @@ from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from flask import Flask, abort, flash, redirect, render_template, request, send_file, url_for
+from markupsafe import Markup
 from .db import connect, get_setting, set_setting
 from .evidence import export
 from .parser import load_pst
@@ -12,7 +13,8 @@ def create_app(data_dir="./data", source=None):
     data = Path(data_dir); data.mkdir(parents=True, exist_ok=True); db_path = data / "investigator.sqlite3"
     conn = connect(db_path)
     if source: set_setting(conn, "source", str(Path(source).expanduser().resolve()))
-    conn.commit(); app.config.update(DB=str(db_path), DATA=str(data))
+    conn.commit(); conn.close()
+    app.config.update(DB=str(db_path), DATA=str(data))
 
     @app.template_filter("datetime")
     def format_datetime(value):
@@ -23,10 +25,10 @@ def create_app(data_dir="./data", source=None):
     def safe_email_html(value):
         try:
             import bleach
-            return bleach.clean(value or "", tags=["p","br","div","span","strong","b","em","i","u","ul","ol","li","table","thead","tbody","tr","th","td","blockquote","a"], attributes={"a":["href","title"], "*": ["class"]}, protocols=["mailto"], strip=True)
+            return Markup(bleach.clean(value or "", tags=["p","br","div","span","strong","b","em","i","u","ul","ol","li","table","thead","tbody","tr","th","td","blockquote","a"], attributes={"a":["href","title"], "*": ["class"]}, protocols=["mailto"], strip=True))
         except ImportError:
             import re
-            return re.sub(r"<(script|style|iframe|object|form)[^>]*>.*?</\1>", "", value or "", flags=re.I|re.S)
+            return Markup(re.sub(r"<(script|style|iframe|object|form)[^>]*>.*?</\1>", "", value or "", flags=re.I|re.S))
 
     def db(): return connect(app.config["DB"])
     def hash_file(path):
@@ -51,7 +53,9 @@ def create_app(data_dir="./data", source=None):
                 vals = [item.get(x, "") for x in fields.split(",")]
                 cur2 = c.execute(f"INSERT INTO emails({fields}) VALUES ({','.join('?' for _ in vals)})", vals); email_id = cur2.lastrowid
                 names = " ".join(a.get("filename", "") for a in atts)
-                c.execute("INSERT INTO emails_fts(rowid,subject,sender,to_recipients,cc,bcc,body_text,attachment_names) VALUES(?,?,?,?,?,?,?,?)", (email_id,item.get("subject",""),item.get("sender",""),item.get("to_recipients",""),item.get("cc",""),item.get("bcc",""),item.get("body_text",""),names))
+                from .parser import html_to_text
+                search_body = " ".join(filter(None, [item.get("body_text", ""), html_to_text(item.get("body_html", ""))]))
+                c.execute("INSERT INTO emails_fts(rowid,subject,sender,to_recipients,cc,bcc,body_text,attachment_names) VALUES(?,?,?,?,?,?,?,?)", (email_id,item.get("subject",""),item.get("sender",""),item.get("to_recipients",""),item.get("cc",""),item.get("bcc",""),search_body,names))
                 for a in atts: c.execute("INSERT INTO attachments(email_id,filename,content_type,size,data) VALUES(?,?,?,?,?)", (email_id,a.get("filename"),a.get("content_type"),a.get("size",0),a.get("data")))
                 indexed += 1
             status = "indexed"
@@ -73,7 +77,8 @@ def create_app(data_dir="./data", source=None):
 
     @app.post("/scan")
     def scan():
-        folder = Path(get_setting(db(), "source", "")); files=sorted(folder.rglob("*.pst")) if folder.is_dir() else []
+        settings_db = db(); source_dir = get_setting(settings_db, "source", ""); settings_db.close()
+        folder = Path(source_dir); files=sorted(folder.rglob("*.pst")) if folder.is_dir() else []
         for path in files:
             try: index_one(path)
             except Exception as exc: flash(f"{path.name}: {exc}", "error")
@@ -101,8 +106,8 @@ def create_app(data_dir="./data", source=None):
         if q:
             joins += " JOIN emails_fts f ON f.rowid=e.id"; where.append("f.emails_fts MATCH ?"); args.append(q)
         for col,val in (("e.sender",sender),("e.subject",subject)):
-            if val: where.append(f"LOWER({col}) LIKE LOWER(?)"); args.append("%"+val+"%")
-        if recipient: where.append("LOWER(e.to_recipients||' '||e.cc||' '||e.bcc) LIKE LOWER(?)"); args.append("%"+recipient+"%")
+            if val: where.append(f"LOWER(COALESCE({col},'')) LIKE LOWER(?)"); args.append("%"+val+"%")
+        if recipient: where.append("LOWER(COALESCE(e.to_recipients,'')||' '||COALESCE(e.cc,'')||' '||COALESCE(e.bcc,'')) LIKE LOWER(?)"); args.append("%"+recipient+"%")
         if start: where.append("date(COALESCE(e.received_at,e.sent_at)) >= date(?)"); args.append(start)
         if end: where.append("date(COALESCE(e.received_at,e.sent_at)) <= date(?)"); args.append(end)
         clause=" WHERE "+" AND ".join(where) if where else ""; c=db(); total=c.execute("SELECT COUNT(*) FROM emails e"+joins+clause,args).fetchone()[0]; rows=c.execute("SELECT e.*,p.filename source_pst,p.path source_path,(SELECT COUNT(*) FROM attachments a WHERE a.email_id=e.id) attachment_count FROM emails e"+joins+clause+f" ORDER BY {order} LIMIT ? OFFSET ?",args+[size,(page-1)*size]).fetchall(); c.close()

@@ -1,7 +1,21 @@
 """PST adapter. The import is deliberately lazy so the web UI remains usable without libpff."""
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.utils import format_datetime
+from email.parser import Parser
+from email.utils import getaddresses
+from html.parser import HTMLParser
+
+class _HTMLText(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.parts = []
+    def handle_data(self, data): self.parts.append(data)
+
+def _html_to_text(value):
+    parser = _HTMLText()
+    try: parser.feed(value or ""); return " ".join("".join(parser.parts).split())
+    except Exception: return _text(value)
+
+html_to_text = _html_to_text
 
 def _value(obj, *names, default=""):
     for name in names:
@@ -23,6 +37,11 @@ def _text(value):
     if isinstance(value, bytes): return value.decode("utf-8", "replace")
     return str(value)
 
+def _safe_value(obj, *names, default=""):
+    """Read one optional libpff property without aborting the message."""
+    try: return _value(obj, *names, default=default)
+    except BaseException: return default
+
 def _date(value):
     if not value: return ""
     if isinstance(value, datetime):
@@ -31,8 +50,25 @@ def _date(value):
     return _text(value)
 
 def _recipients(message, kind):
-    names = {"to": ["display_to", "get_display_to"], "cc": ["display_cc", "get_display_cc"], "bcc": ["display_bcc", "get_display_bcc"]}[kind]
-    return _text(_value(message, *names))
+    names = {"to": ["display_to"], "cc": ["display_cc"], "bcc": ["display_bcc"]}[kind]
+    value = _safe_value(message, *names)
+    return _text(value)
+
+def _header_values(message):
+    """Return address-bearing headers preserved in the original message."""
+    raw = _safe_value(message, "transport_headers", default="")
+    if not raw: return {}
+    try:
+        parsed = Parser().parsestr(_text(raw))
+        result = {}
+        for key in ("from", "to", "cc", "bcc", "reply-to"):
+            values = parsed.get_all(key.title(), [])
+            result[key] = ", ".join(
+                (f"{name} <{address}>" if name and address else name or address)
+                for name, address in getaddresses(values) if name or address
+            )
+        return result
+    except Exception: return {}
 
 def load_pst(path):
     try:
@@ -70,21 +106,29 @@ def _walk_folder(folder, parent):
         yield from _walk_folder(folder.get_sub_folder(i), folder_path)
 
 def _message(message, folder):
+    headers = _header_values(message)
     attachments = []
-    for i in range(_value(message, "number_of_attachments", default=0) or 0):
+    for i in range(_safe_value(message, "number_of_attachments", default=0) or 0):
         try:
             att = message.get_attachment(i)
             data = b""
             try:
-                size = _value(att, "size", default=0) or 0
+                size = _safe_value(att, "size", default=0) or 0
                 data = att.read_buffer(size) if size else b""
             except Exception: pass
-            attachments.append({"filename": _text(_value(att, "name", "display_name")), "content_type": _text(_value(att, "mime_type", "content_type")), "size": len(data), "data": data})
+            attachments.append({"filename": _text(_safe_value(att, "long_filename", "short_filename", "name", "display_name")), "content_type": _text(_safe_value(att, "mime_type", "content_type")), "size": len(data), "data": data})
         except Exception: pass
-    body_text = _text(_value(message, "plain_text_body", "body", "plain_text"))
-    body_html = _text(_value(message, "html_body", "html"))
-    sender = _text(_value(message, "sender_name", "sender_email_address", "display_from"))
-    return {"folder": folder, "sender": sender, "to_recipients": _recipients(message, "to"), "cc": _recipients(message, "cc"), "bcc": _recipients(message, "bcc"), "subject": _text(_value(message, "subject")), "sent_at": _date(_value(message, "client_submit_time", "delivery_time")), "received_at": _date(_value(message, "delivery_time")), "message_id": _text(_value(message, "internet_message_id")), "conversation": _text(_value(message, "conversation_topic")), "importance": _text(_value(message, "importance")), "size": int(_value(message, "size", default=0) or 0), "body_text": body_text, "body_html": body_html, "attachments": attachments}
+    body_text = _text(_safe_value(message, "plain_text_body", "body", "plain_text"))
+    # libpff legitimately raises an error when the HTML property is absent.
+    # Missing HTML is not a corrupt message and must not prevent indexing it.
+    body_html = _text(_safe_value(message, "html_body", "html"))
+    if not body_html and any(token in body_text.lower() for token in ("<html", "<body", "<div", "<p>", "<br")):
+        body_html, body_text = body_text, _html_to_text(body_text)
+    sender = _text(_safe_value(message, "sender_name", "sender_email_address", "display_from")) or headers.get("from", "")
+    to = _recipients(message, "to") or headers.get("to", "")
+    cc = _recipients(message, "cc") or headers.get("cc", "")
+    bcc = _recipients(message, "bcc") or headers.get("bcc", "")
+    return {"folder": folder, "sender": sender, "to_recipients": to, "cc": cc, "bcc": bcc, "subject": _text(_safe_value(message, "subject")) or Parser().parsestr(_text(_safe_value(message, "transport_headers"))).get("Subject", ""), "sent_at": _date(_safe_value(message, "client_submit_time", "delivery_time")), "received_at": _date(_safe_value(message, "delivery_time")), "message_id": _text(_safe_value(message, "internet_message_id")) or Parser().parsestr(_text(_safe_value(message, "transport_headers"))).get("Message-ID", ""), "conversation": _text(_safe_value(message, "conversation_topic")), "importance": _text(_safe_value(message, "importance")), "size": int(_safe_value(message, "size", default=0) or 0), "body_text": body_text, "body_html": body_html, "attachments": attachments}
 
 def as_eml(item):
     msg = EmailMessage()
